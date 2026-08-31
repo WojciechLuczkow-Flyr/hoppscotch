@@ -27,6 +27,9 @@ interface ImportMetaEnv {
   readonly VITE_SENTRY_RELEASE_TAG?: string
 
   readonly VITE_PROXYSCOTCH_ACCESS_TOKEN?: string
+
+  /** OAuth 2.0 callback URL. Defaults to `<origin>/oauth` when unset. */
+  readonly VITE_OAUTH_REDIRECT_URI?: string
 }
 
 interface ImportMeta {

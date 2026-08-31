@@ -115,6 +115,33 @@
           <span v-else>
             {{ t("authorization.save_to_inherit") }}
           </span>
+
+          <!--
+            Token actions for inherited OAuth 2.0. Without these, refreshing a
+            short-lived token means leaving the request, finding the parent
+            collection and opening its properties modal.
+          -->
+          <div
+            v-if="canActOnInheritedOAuth"
+            class="flex items-center gap-2 mt-4"
+          >
+            <HoppButtonSecondary
+              :label="t('authorization.oauth.generate_token')"
+              :loading="isGeneratingInheritedToken"
+              filled
+              outline
+              @click="generateInheritedToken"
+            />
+            <HoppButtonSecondary
+              :label="t('authorization.oauth.refresh_token')"
+              :loading="isRefreshingInheritedToken"
+              outline
+              @click="refreshInheritedToken"
+            />
+            <span class="text-tiny text-secondaryLight">
+              {{ inheritedTokenStatus }}
+            </span>
+          </div>
         </div>
         <div v-if="auth.authType === 'bearer'">
           <div class="flex flex-1 border-b border-dividerLight">
@@ -202,7 +229,8 @@ import { useColorMode } from "@composables/theming"
 import { useVModel } from "@vueuse/core"
 import { computed, onMounted, ref } from "vue"
 import { HoppInheritedProperty } from "~/helpers/types/HoppInheritedProperties"
-import { AggregateEnvironment } from "~/newstore/environments"
+import { AggregateEnvironment, environments$ } from "~/newstore/environments"
+import { useReadonlyStream } from "@composables/stream"
 import IconCircle from "~icons/lucide/circle"
 import IconCircleDot from "~icons/lucide/circle-dot"
 import IconExternalLink from "~icons/lucide/external-link"
@@ -210,6 +238,18 @@ import IconHelpCircle from "~icons/lucide/help-circle"
 import IconTrash2 from "~icons/lucide/trash-2"
 
 import { getDefaultAuthCodeOauthFlowParams } from "~/services/oauth/flows/authCode"
+import { writeTokenToParent } from "~/services/oauth/parentAuthWriteback"
+import {
+  generateTokenFromInheritedAuth,
+  isInheritedOAuthActionable,
+  refreshTokenFromInheritedAuth,
+} from "~/services/oauth/inheritedAuth"
+import {
+  isAccessTokenExpired,
+  readStoredTokens,
+} from "~/services/oauth/envTokenStore"
+import { useToast } from "@composables/toast"
+import * as E from "fp-ts/Either"
 import {
   HoppRESTAuth,
   HoppRESTAuthAWSSignature,
@@ -220,6 +260,7 @@ import {
 } from "@hoppscotch/data"
 
 const t = useI18n()
+const toast = useToast()
 
 const colorMode = useColorMode()
 
@@ -246,6 +287,148 @@ const emit = defineEmits<{
 }>()
 
 const auth = useVModel(props, "modelValue", emit)
+
+/* --- Token actions for auth inherited from a parent collection ------------ */
+
+const isGeneratingInheritedToken = ref(false)
+
+const isRefreshingInheritedToken = ref(false)
+
+/** Only offered for inherited authorization-code OAuth 2.0. */
+const canActOnInheritedOAuth = computed(
+  () =>
+    auth.value.authType === "inherit" &&
+    isInheritedOAuthActionable(props.inheritedProperties?.auth.inheritedAuth)
+)
+
+/**
+ * Short status next to the buttons, so the state of a token stored in the
+ * environment is visible without opening the environment editor.
+ */
+/**
+ * `environmentsStore.value` is an rxjs BehaviorSubject read, not a Vue ref, so
+ * a computed touching it would never re-evaluate. Subscribing here gives the
+ * status below something reactive to depend on.
+ */
+const environmentsSnapshot = useReadonlyStream(environments$, [])
+
+const inheritedTokenStatus = computed(() => {
+  // Referenced purely to register the dependency; the values come from the
+  // store helpers, which read the same source.
+  void environmentsSnapshot.value
+
+  const tokens = readStoredTokens()
+
+  if (!tokens.accessToken) return t("authorization.oauth.no_stored_token")
+  if (isAccessTokenExpired(tokens))
+    return t("authorization.oauth.token_expired")
+
+  if (tokens.expiresAt === null) return t("authorization.oauth.token_stored")
+
+  const minutes = Math.max(
+    0,
+    Math.round((tokens.expiresAt - Date.now()) / 60_000)
+  )
+  return t("authorization.oauth.token_valid_for", { minutes })
+})
+
+/**
+ * Push the token onto the parent collection so the request that triggered this
+ * actually uses it. Storing it only in the environment would require the parent
+ * to reference `<<access_token>>`, which is easy to forget.
+ */
+const applyTokenToParent = async (tokens: {
+  access_token: string
+  refresh_token?: string
+}) => {
+  const failure = await writeTokenToParent(
+    props.inheritedProperties?.auth.parentID,
+    props.source,
+    tokens.access_token,
+    tokens.refresh_token
+  )
+
+  // Every failure is surfaced: a silently skipped write looks identical to a
+  // broken token, which is impossible to diagnose from the UI.
+  const messages: Record<string, string> = {
+    TEAM_WRITE_FAILED: "authorization.oauth.parent_team_write_failed",
+    NO_PARENT: "authorization.oauth.parent_write_no_parent",
+    PARENT_NOT_FOUND: "authorization.oauth.parent_write_not_found",
+    PARENT_NOT_OAUTH2: "authorization.oauth.parent_write_not_oauth2",
+  }
+
+  if (failure) {
+    toast.show(`${t(messages[failure])}`)
+    // Also log the parent identifier: it distinguishes a team path (opaque ids)
+    // from a personal index path at a glance.
+    console.warn(
+      "[oauth] parent token write skipped:",
+      failure,
+      "parentID:",
+      props.inheritedProperties?.auth.parentID
+    )
+  }
+}
+
+const inheritedAuthErrorMessage = (error: string) => {
+  switch (error) {
+    case "NO_REFRESH_TOKEN":
+      return t("authorization.oauth.no_refresh_token_present")
+    case "INVALID_CONFIG":
+      return t("authorization.oauth.something_went_wrong_on_token_generation")
+    default:
+      return t("authorization.oauth.something_went_wrong_on_token_generation")
+  }
+}
+
+const generateInheritedToken = async () => {
+  const inherited = props.inheritedProperties?.auth.inheritedAuth
+  if (!inherited) return
+
+  isGeneratingInheritedToken.value = true
+  try {
+    const res = await generateTokenFromInheritedAuth(inherited)
+    if (E.isLeft(res)) {
+      toast.error(`${inheritedAuthErrorMessage(res.left)}`)
+      return
+    }
+    await applyTokenToParent(res.right)
+    toast.success(`${t("authorization.oauth.token_fetched_successfully")}`)
+  } finally {
+    isGeneratingInheritedToken.value = false
+  }
+}
+
+const refreshInheritedToken = async () => {
+  const inherited = props.inheritedProperties?.auth.inheritedAuth
+  if (!inherited) return
+
+  isRefreshingInheritedToken.value = true
+  try {
+    // Prefer the refresh token held in the environment; fall back to one saved
+    // on the parent collection for setups that predate environment storage.
+    const stored = readStoredTokens().refreshToken
+    const fromParent =
+      inherited.authType === "oauth-2" &&
+      "refreshToken" in inherited.grantTypeInfo
+        ? (inherited.grantTypeInfo.refreshToken ?? "")
+        : ""
+
+    const res = await refreshTokenFromInheritedAuth(
+      inherited,
+      stored || fromParent
+    )
+
+    if (E.isLeft(res)) {
+      toast.error(`${inheritedAuthErrorMessage(res.left)}`)
+      return
+    }
+    await applyTokenToParent(res.right)
+    toast.success(`${t("authorization.oauth.token_fetched_successfully")}`)
+  } finally {
+    isRefreshingInheritedToken.value = false
+  }
+}
 
 onMounted(() => {
   if (props.isRootCollection && auth.value.authType === "inherit") {

@@ -27,6 +27,8 @@ import passwordFlow, {
   getDefaultPasswordFlowParams,
 } from "~/services/oauth/flows/password"
 import { AuthRequestParam, TokenRequestParam } from "./useOAuth2AdvancedParams"
+import { writeTokensToActiveEnvironment } from "~/services/oauth/envTokenStore"
+import { OAuthTokenResponse } from "~/services/oauth/oauth.service"
 
 export type GrantTypes = z.infer<
   typeof HoppRESTAuthOAuth2
@@ -46,6 +48,24 @@ export const useOAuth2GrantTypes = (
 ) => {
   const t = useI18n()
   const toast = useToast()
+
+  /**
+   * Mirror every freshly issued token into the active environment.
+   *
+   * Requests that inherit auth from a parent collection can then reference
+   * `<<access_token>>` once and stay correct across environment switches,
+   * instead of the parent holding a literal token tied to whichever
+   * environment was active when it was generated.
+   */
+  const persistTokensToEnvironment = (tokens: OAuthTokenResponse) => {
+    const failure = writeTokensToActiveEnvironment(tokens)
+
+    if (failure === "NO_ENVIRONMENT_SELECTED") {
+      toast.show(`${t("authorization.oauth.token_not_stored_no_env")}`)
+    } else if (failure === "TEAM_ENV_UNSUPPORTED") {
+      toast.show(`${t("authorization.oauth.token_not_stored_team_env")}`)
+    }
+  }
 
   // Token type dropdown options (shared across all grant types). The OAuth2
   // dropdown component reads `ref.value.{id,label}` and assigns the whole
@@ -274,6 +294,7 @@ export const useOAuth2GrantTypes = (
             res.right.access_token,
             res.right.refresh_token
           )
+          persistTokensToEnvironment(res.right)
 
           return E.right(undefined)
         }
@@ -310,6 +331,19 @@ export const useOAuth2GrantTypes = (
 
           if (E.isLeft(res)) {
             return res
+          }
+
+          // The popup flow completes the exchange without ever unloading this
+          // tab, so the token comes back here rather than being applied by the
+          // `/oauth` route after a full-page redirect.
+          if (res.right?.access_token) {
+            setAccessTokenInActiveContext(
+              res.right.access_token,
+              res.right.refresh_token
+            )
+            persistTokensToEnvironment(res.right)
+
+            toast.success(t("authorization.oauth.token_fetched_successfully"))
           }
 
           return E.right(undefined)

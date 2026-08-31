@@ -33,6 +33,18 @@ export type PersistedOAuthConfig = {
 
 export const grantTypesInvolvingRedirect = ["AUTHORIZATION_CODE", "IMPLICIT"]
 
+/**
+ * What a token or refresh exchange yields.
+ *
+ * `expires_in` is the provider's lifetime in seconds when it sends one; callers
+ * convert it to an absolute timestamp before storing.
+ */
+export type OAuthTokenResponse = {
+  access_token: string
+  refresh_token?: string
+  expires_in?: number
+}
+
 export const routeOAuthRedirect = async () => {
   // get the temp data from the local storage
   const localOAuthTempConfig =
@@ -75,27 +87,20 @@ export function createFlowConfig<
 >(
   flow: Flow,
   params: ZodType<AuthParams>,
+  // Redirect-based flows resolve with `undefined` because the token only
+  // arrives after the provider redirects back. The popup variant completes the
+  // exchange inline, so it resolves with the token instead.
   init: (
     params: AuthParams
   ) =>
-    | E.Either<string, InitFuncReturnObject>
-    | Promise<E.Either<string, InitFuncReturnObject>>
-    | E.Either<string, undefined>
-    | Promise<E.Either<string, undefined>>,
+    | E.Either<string, InitFuncReturnObject | undefined>
+    | Promise<E.Either<string, InitFuncReturnObject | undefined>>,
   onRedirectReceived: (localConfig: string) => Promise<
-    E.Either<
-      string,
-      {
-        access_token: string
-        refresh_token?: string
-      }
-    >
+    E.Either<string, OAuthTokenResponse>
   >,
   refreshToken?: (
     params: RefreshTokenParams
-  ) => Promise<
-    E.Either<string, { access_token: string; refresh_token?: string }>
-  >
+  ) => Promise<E.Either<string, OAuthTokenResponse>>
 ) {
   return {
     flow,
@@ -121,7 +126,17 @@ export const decodeResponseAsJSON = (response: {
 export class OauthAuthService extends Service {
   public static readonly ID = "OAUTH_AUTH_SERVICE"
 
-  static redirectURI = `${window.location.origin}/oauth`
+  /**
+   * Where the authorization server sends the user back to.
+   *
+   * Defaults to `<origin>/oauth`, but can be pointed at any path the identity
+   * provider already has registered -- some IdPs are administered by a
+   * different team, and getting a new callback URL allow-listed is slower than
+   * matching one that exists. The router forwards OAuth params arriving on any
+   * path to `/oauth`, so the handling code stays in one place.
+   */
+  static redirectURI =
+    import.meta.env.VITE_OAUTH_REDIRECT_URI || `${window.location.origin}/oauth`
 }
 
 export const generateRandomString = () => {

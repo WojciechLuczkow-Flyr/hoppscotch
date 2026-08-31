@@ -543,7 +543,7 @@
 <script setup lang="ts">
 import { HoppGQLAuthOAuth2, HoppRESTAuthOAuth2 } from "@hoppscotch/data"
 import { useService } from "dioc/vue"
-import { computed, onMounted, ref } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 import { useI18n } from "~/composables/i18n"
 import { useOAuth2AdvancedParams } from "~/composables/oauth2/useOAuth2AdvancedParams"
 import { useOAuth2GrantTypes } from "~/composables/oauth2/useOAuth2GrantTypes"
@@ -555,7 +555,12 @@ import {
   sendInOptions,
   sendInOptionsLabels,
 } from "~/helpers/oauth2Params"
-import { AggregateEnvironment } from "~/newstore/environments"
+import {
+  AggregateEnvironment,
+  selectedEnvironmentIndex$,
+  SelectedEnvironmentIndex,
+} from "~/newstore/environments"
+import { useReadonlyStream } from "~/composables/stream"
 import {
   grantTypesInvolvingRedirect,
   PersistedOAuthConfig,
@@ -741,6 +746,81 @@ const setAccessTokenInActiveContext = (
     }
   }
 }
+
+/**
+ * A stable identity for the selected environment.
+ *
+ * Deliberately keyed on identity, not contents: editing a variable inside the
+ * current environment should not throw away a working token, only switching to
+ * a different environment should.
+ */
+const selectedEnvKey = (index: SelectedEnvironmentIndex): string => {
+  switch (index.type) {
+    case "MY_ENV":
+      return `MY_ENV:${index.index}`
+    case "TEAM_ENV":
+      return `TEAM_ENV:${index.teamEnvID}`
+    default:
+      return "NO_ENV"
+  }
+}
+
+const selectedEnvIndex = useReadonlyStream(selectedEnvironmentIndex$, {
+  type: "NO_ENV_SELECTED",
+} as SelectedEnvironmentIndex)
+
+/**
+ * Drop a token that was issued under a different environment.
+ *
+ * The token is stored as a literal string, and the environment supplies the
+ * tenant, client id and audience it was obtained with -- so after switching
+ * environments the stored token belongs to the wrong issuer. Sending it anyway
+ * produces a confusing 401 from an unrelated API; clearing it surfaces the
+ * problem where the user can act on it.
+ *
+ * Mirrors the three contexts `setAccessTokenInActiveContext` writes to.
+ */
+const clearTokenForEnvironmentChange = () => {
+  const clear = <T extends { token?: string; refreshToken?: string }>(
+    grantTypeInfo: T
+  ) => {
+    grantTypeInfo.token = ""
+    if ("refreshToken" in grantTypeInfo) grantTypeInfo.refreshToken = undefined
+  }
+
+  if (props.isCollectionProperty) {
+    clear(auth.value.grantTypeInfo)
+    return
+  }
+
+  const tab =
+    props.source === "REST"
+      ? workspaceTabsService.currentActiveTab.value
+      : gqlTabsService.currentActiveTab.value
+
+  if (
+    "request" in tab.document &&
+    tab.document.request &&
+    tab.document.request.auth.authType === "oauth-2"
+  ) {
+    clear(tab.document.request.auth.grantTypeInfo)
+  }
+
+  // Keep the panel in sync when the tab document is the source of truth.
+  clear(auth.value.grantTypeInfo)
+}
+
+watch(
+  () => selectedEnvKey(selectedEnvIndex.value),
+  (next, previous) => {
+    // `previous` is undefined on the first run; only a real switch counts.
+    if (previous === undefined || next === previous) return
+    if (!auth.value.grantTypeInfo?.token) return
+
+    clearTokenForEnvironmentChange()
+    toast.show(`${t("authorization.oauth.token_cleared_on_env_change")}`)
+  }
+)
 
 const refreshOauthToken = async () => {
   if (!runTokenRefresh.value) {

@@ -99,6 +99,9 @@ export const refreshToken = async ({
   const withAccessTokenAndRefreshTokenSchema = z.object({
     access_token: z.string(),
     refresh_token: z.string().optional(),
+    // A refreshed token has its own lifetime; without this the caller cannot
+    // tell when to refresh again.
+    expires_in: z.number().optional(),
   })
 
   const parsedTokenResponse = withAccessTokenAndRefreshTokenSchema.safeParse(

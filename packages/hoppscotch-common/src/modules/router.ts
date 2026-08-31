@@ -58,6 +58,19 @@ export default <HoppModule>{
     )
 
     router.beforeEach(async (to, from) => {
+      // When VITE_OAUTH_REDIRECT_URI points somewhere other than /oauth, the
+      // authorization server drops the user on that path with ?code=&state=.
+      // Forward those to /oauth, which owns the token exchange (and the popup
+      // hand-off), rather than duplicating that logic per route.
+      if (
+        to.path !== "/oauth" &&
+        typeof to.query.state === "string" &&
+        (typeof to.query.code === "string" ||
+          typeof to.query.error === "string")
+      ) {
+        return { path: "/oauth", query: to.query, hash: to.hash }
+      }
+
       // preserve the ?org= query param across all route transitions.
       // the param originates from the Rust load command which sets it
       // on the initial webview URL. without this guard, navigating to

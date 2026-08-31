@@ -248,6 +248,7 @@ import { runMutation } from "~/helpers/backend/GQLClient"
 import { UpdateRequestDocument } from "~/helpers/backend/graphql"
 import { getPlatformSpecialKey as getSpecialKey } from "~/helpers/platformutils"
 import { runRESTRequest$ } from "~/helpers/RequestRunner"
+import { ensureFreshOAuthToken } from "~/services/oauth/inheritedAuth"
 import { HoppRESTResponse } from "~/helpers/types/HoppRESTResponse"
 import { editRESTRequest } from "~/newstore/collections"
 import IconChevronDown from "~icons/lucide/chevron-down"
@@ -361,6 +362,18 @@ const newSendRequest = async () => {
     strategy: interceptorService.current.value!.id,
     workspaceType: workspaceService.currentWorkspace.value.type,
   })
+
+  // Refresh a near-expired OAuth token before the request is built, so a
+  // short-lived token does not turn every send after ~15 minutes into a 401.
+  // Must happen here rather than inside `runRESTRequest$`: that function is
+  // synchronous and snapshots the environment before its async phase, so a
+  // token written later would not reach this request.
+  const { request: currentRequest, inheritedProperties } = tab.value.document
+  await ensureFreshOAuthToken(
+    currentRequest.auth.authType === "inherit" && currentRequest.auth.authActive
+      ? inheritedProperties?.auth.inheritedAuth
+      : currentRequest.auth
+  )
 
   const [cancel, streamPromise] = runRESTRequest$(tab)
   const streamResult = await streamPromise

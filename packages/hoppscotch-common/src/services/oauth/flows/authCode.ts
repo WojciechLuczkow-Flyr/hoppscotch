@@ -16,6 +16,7 @@ import {
   AuthCodeGrantTypeParams,
   OAuth2AuthRequestParam,
 } from "@hoppscotch/data"
+import { awaitOAuthPopupRedirect, openOAuthPopup } from "../popup"
 
 const persistenceService = getService(PersistenceService)
 const interceptorService = getService(KernelInterceptorService)
@@ -89,6 +90,11 @@ const initAuthCodeOauthFlow = async ({
   tokenRequestParams,
   tokenType,
 }: AuthCodeOauthFlowParams) => {
+  // Opened before any `await` -- a `window.open` that happens after the
+  // microtask queue yields is no longer attributed to the user's click and
+  // gets blocked. The window sits on about:blank until the URL is ready.
+  const popup = openOAuthPopup()
+
   const state = generateRandomString()
 
   let codeVerifier: string | undefined
@@ -214,15 +220,44 @@ const initAuthCodeOauthFlow = async ({
     })
   }
 
+  // Preferred path: log in inside a popup so the user's tab (and its unsaved
+  // request state) survives the round trip. `popup` is null when the browser
+  // blocked it, in which case fall back to navigating the tab.
+  if (popup) {
+    popup.location.href = url.toString()
+
+    const redirectParams = await awaitOAuthPopupRedirect(popup)
+
+    if (E.isLeft(redirectParams)) {
+      popup.close()
+      return E.left(redirectParams.left)
+    }
+
+    popup.close()
+
+    const localConfig =
+      await persistenceService.getLocalConfig("oauth_temp_config")
+
+    if (!localConfig) {
+      return E.left("INVALID_LOCAL_CONFIG")
+    }
+
+    return handleRedirectForAuthCodeOauthFlow(localConfig, redirectParams.right)
+  }
+
   // Redirect to the authorization server
   window.location.assign(url.toString())
 
   return E.right(undefined)
 }
 
-const handleRedirectForAuthCodeOauthFlow = async (localConfig: string) => {
-  // parse the query string
-  const params = new URLSearchParams(window.location.search)
+const handleRedirectForAuthCodeOauthFlow = async (
+  localConfig: string,
+  // Supplied by the popup flow, which receives the query string via
+  // postMessage rather than from its own address bar.
+  redirectParams?: URLSearchParams
+) => {
+  const params = redirectParams ?? new URLSearchParams(window.location.search)
 
   const code = params.get("code")
   const state = params.get("state")
@@ -240,7 +275,8 @@ const handleRedirectForAuthCodeOauthFlow = async (localConfig: string) => {
     source: z.optional(z.string()),
     state: z.string(),
     tokenEndpoint: z.string(),
-    clientSecret: z.string(),
+    // Absent for public clients -- see the token request below.
+    clientSecret: z.string().optional(),
     clientID: z.string(),
     codeVerifier: z.string().optional(),
     codeChallenge: z.string().optional(),
@@ -274,8 +310,13 @@ const handleRedirectForAuthCodeOauthFlow = async (localConfig: string) => {
       code,
       grant_type: "authorization_code",
       client_id: decodedLocalConfig.data.clientID,
-      client_secret: decodedLocalConfig.data.clientSecret,
       redirect_uri: OauthAuthService.redirectURI,
+      // Public clients (PKCE, `token_endpoint_auth_method: none`) have no
+      // secret. Sending an empty `client_secret` is not the same as omitting
+      // it -- Auth0 and Okta reject the request outright.
+      ...(decodedLocalConfig.data.clientSecret
+        ? { client_secret: decodedLocalConfig.data.clientSecret }
+        : {}),
       ...(decodedLocalConfig.data.codeVerifier && {
         code_verifier: decodedLocalConfig.data.codeVerifier,
       }),
@@ -299,6 +340,9 @@ const handleRedirectForAuthCodeOauthFlow = async (localConfig: string) => {
       access_token: z.string().optional(),
       id_token: z.string().optional(),
       refresh_token: z.string().optional(),
+      // Needed to know when the token dies. Short-lived tokens (15 min is
+      // common) make this the difference between a silent refresh and a 401.
+      expires_in: z.number().optional(),
     })
     .refine((data) => data.access_token || data.id_token, {
       message: "Either access_token or id_token must be present",
@@ -326,21 +370,23 @@ const handleRedirectForAuthCodeOauthFlow = async (localConfig: string) => {
           parsedTokenResponse.data.id_token ||
           "",
     refresh_token: parsedTokenResponse.data.refresh_token,
+    expires_in: parsedTokenResponse.data.expires_in,
   })
 }
 
 const generateCodeVerifier = () => {
   const characters =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-  const length = Math.floor(Math.random() * (128 - 43 + 1)) + 43 // Random length between 43 and 128
-  let codeVerifier = ""
 
-  for (let i = 0; i < length; i++) {
-    const randomIndex = Math.floor(Math.random() * characters.length)
-    codeVerifier += characters[randomIndex]
-  }
+  // The verifier is the sole secret binding the authorization request to the
+  // token exchange, so it has to come from a CSPRNG -- `Math.random()` is
+  // predictable and would let an attacker who intercepts the code redeem it.
+  const length = 64 // within the 43..128 range required by RFC 7636
+  const values = crypto.getRandomValues(new Uint8Array(length))
 
-  return codeVerifier
+  return Array.from(values)
+    .map((value) => characters[value % characters.length])
+    .join("")
 }
 
 const generateCodeChallenge = async (

@@ -21,6 +21,7 @@ import {
 } from "~/services/oauth/oauth.service"
 import { PersistenceService } from "~/services/persistence"
 import { GQLTabService } from "~/services/tab/graphql"
+import { postRedirectToOpener } from "~/services/oauth/popup"
 
 const t = useI18n()
 const router = useRouter()
@@ -68,6 +69,11 @@ function translateOAuthRedirectError(error: string) {
 }
 
 onMounted(async () => {
+  // When the flow ran in a popup, this document is the popup: hand the
+  // authorization code to the tab that opened us and close. The opener still
+  // holds the request tab the token belongs to, so it does the exchange.
+  if (postRedirectToOpener()) return
+
   const localOAuthTempConfig =
     await persistenceService.getLocalConfig("oauth_temp_config")
 
