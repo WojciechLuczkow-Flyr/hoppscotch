@@ -31,7 +31,10 @@ import { runGQLQuery, runGQLSubscription } from "~/helpers/backend/GQLClient"
 import { HoppInheritedProperty } from "~/helpers/types/HoppInheritedProperties"
 import { ref, watch } from "vue"
 import { Service } from "dioc"
-import { updateInheritedPropertiesForAffectedRequests } from "~/helpers/collection/collection"
+import {
+  refreshInheritedPropertiesForOpenTeamTabs,
+  updateInheritedPropertiesForAffectedRequests,
+} from "~/helpers/collection/collection"
 import { hasActualScript } from "@hoppscotch/js-sandbox/scripting"
 import { CollectionDataProps } from "~/helpers/backend/helpers"
 
@@ -412,6 +415,12 @@ export class TeamCollectionsService extends Service<void> {
     )
 
     this.collections.value.push(...totalCollections)
+
+    // Open tabs were restored before the tree existed; bring their inherited
+    // auth/headers back in line with it. Best-effort, must not block loading.
+    refreshInheritedPropertiesForOpenTeamTabs().catch((e) =>
+      console.error("Failed to refresh inherited properties for open tabs", e)
+    )
   }
 
   /**

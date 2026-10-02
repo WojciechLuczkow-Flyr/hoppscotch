@@ -216,6 +216,48 @@ export function updateInheritedPropertiesForAffectedRequests(
   })
 }
 
+/**
+ * Re-derives inherited properties for every open tab that belongs to a team
+ * collection, expanding folders as needed.
+ *
+ * Tabs restored on page load carry whatever snapshot was persisted, and the
+ * sync cascade returns `authType: "none"` for any path it cannot find in the
+ * tree yet -- a result that then gets persisted and survives later loads. That
+ * is why inherited OAuth actions could stay hidden until a lucky refresh.
+ * Called once the team's root collections are in, so the tree is authoritative.
+ */
+export async function refreshInheritedPropertiesForOpenTeamTabs() {
+  const tabService = getService(WorkspaceTabsService)
+  const teamCollectionService = getService(TeamCollectionsService)
+
+  const teamTabs = tabService.getTabsRefTo((tab) => {
+    if ("type" in tab.document && tab.document.type === "test-runner")
+      return false
+    return tab.document.saveContext?.originLocation === "team-collection"
+  })
+
+  for (const tab of teamTabs) {
+    const doc = tab.value.document
+    if ("type" in doc && doc.type === "test-runner") continue
+    if (doc.saveContext?.originLocation !== "team-collection") continue
+
+    const collectionID = doc.saveContext.collectionID
+    if (!collectionID) continue
+
+    const resolved =
+      await teamCollectionService.cascadeParentCollectionForPropertiesAsync(
+        collectionID
+      )
+
+    // Only overwrite when the whole path is present in the tree; otherwise we
+    // would be writing the same lossy "none" snapshot this exists to repair.
+    const leafID = collectionID.split("/").filter(Boolean).pop()
+    if (!leafID || !teamCollectionService.findCollectionByID(leafID)) continue
+
+    tab.value.document.inheritedProperties = resolved
+  }
+}
+
 function resetSaveContextForAffectedRequests(folderPath: string) {
   const tabService = getService(WorkspaceTabsService)
   const tabs = tabService.getTabsRefTo((tab) => {

@@ -145,7 +145,7 @@
 </template>
 
 <script setup lang="ts">
-import { Ref, onMounted, ref } from "vue"
+import { Ref, onMounted, reactive, ref } from "vue"
 
 import { useI18n } from "@composables/i18n"
 import { useStreamSubscriber } from "@composables/stream"
@@ -176,9 +176,10 @@ const toast = useToast()
 
 const persistenceService = useService(PersistenceService)
 
-const form = {
+// Reactive so an address restored asynchronously reaches the input.
+const form = reactive({
   email: "",
-}
+})
 
 const isLoadingAllowedAuthProviders = ref(true)
 
@@ -208,6 +209,11 @@ const doAdditionalLoginItemClickAction = async (item: LoginItemDef) => {
 }
 
 onMounted(async () => {
+  // Magic-link logins are frequent enough that retyping the address every
+  // time is a chore; the last one sent is already persisted on submit.
+  const lastEmail = await persistenceService.getLocalConfig("emailForSignIn")
+  if (lastEmail) form.email = lastEmail
+
   const currentUser$ = platform.auth.getCurrentUserStream()
 
   subscribeToStream(currentUser$, (user) => {
